@@ -1,6 +1,12 @@
+<script setup lang="ts">
+import { useWindowDrag } from "./composables/useWindowDrag";
+
+const { onPointerDown } = useWindowDrag();
+</script>
+
 <template>
   <main class="transparent-test">
-    <p class="test-marker">摸鱼 v2.0 · 透明窗口测试</p>
+    <p class="test-marker" @pointerdown="onPointerDown">摸鱼 v2.0 · 透明窗口测试</p>
   </main>
 </template>
 
@@ -32,6 +38,8 @@ body,
 }
 
 .test-marker {
+  cursor: grab;
+  user-select: none;
   margin: 0;
   padding: 8px 12px;
   color: #ffffff;
@@ -40,5 +48,9 @@ body,
   font-size: 18px;
   line-height: 1.5;
   text-align: center;
+}
+
+.test-marker:active {
+  cursor: grabbing;
 }
 </style>
