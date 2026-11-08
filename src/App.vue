@@ -3,6 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWindowDrag } from "./composables/useWindowDrag";
+import tuantuanFull from "./assets/fish/tuantuan-cropped.png";
 
 const { onPointerDown } = useWindowDrag();
 const marker = ref<HTMLElement | null>(null);
@@ -62,7 +63,14 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="transparent-test">
-    <p ref="marker" class="test-marker" @pointerdown="onPointerDown">摸鱼 v2.0 · 透明窗口测试</p>
+    <img
+      ref="marker"
+      class="test-marker"
+      :src="tuantuanFull"
+      alt="团团"
+      :draggable="false"
+      @pointerdown="onPointerDown"
+    />
   </main>
 </template>
 
@@ -94,16 +102,15 @@ body,
 }
 
 .test-marker {
+  display: block;
+  width: min(280px, 100vw, 100vh);
+  height: min(280px, 100vw, 100vh);
+  object-fit: contain;
   cursor: grab;
   user-select: none;
   margin: 0;
-  padding: 8px 12px;
-  color: #ffffff;
+  padding: 0;
   background: transparent;
-  text-shadow: 0 1px 2px #000000;
-  font-size: 18px;
-  line-height: 1.5;
-  text-align: center;
 }
 
 .test-marker:active {
