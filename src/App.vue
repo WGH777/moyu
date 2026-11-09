@@ -3,9 +3,12 @@ import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWindowDrag } from "./composables/useWindowDrag";
-import tuantuanFull from "./assets/fish/tuantuan-cropped.png";
+import TuantuanLife from "./components/TuantuanLife.vue";
+import TuantuanFinPreview from "./components/experiments/TuantuanFinPreview.vue";
+import TuantuanIdlePreview from "./components/experiments/TuantuanIdlePreview.vue";
 
 const { onPointerDown } = useWindowDrag();
+const previewMode = ref<"official" | "fin" | "idle">("official");
 const marker = ref<HTMLElement | null>(null);
 let observer: ResizeObserver | undefined;
 let unlistenScale: (() => void) | undefined;
@@ -63,14 +66,20 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="transparent-test">
-    <img
+    <div
       ref="marker"
       class="test-marker"
-      :src="tuantuanFull"
-      alt="团团"
-      :draggable="false"
       @pointerdown="onPointerDown"
-    />
+    >
+      <TuantuanFinPreview v-if="previewMode === 'fin'" />
+      <TuantuanIdlePreview v-else-if="previewMode === 'idle'" />
+      <TuantuanLife v-else />
+      <nav class="preview-modes" aria-label="团团预览模式">
+        <button class="preview-toggle" type="button" :aria-pressed="previewMode === 'official'" @click="previewMode = 'official'">正式团团</button>
+        <button class="preview-toggle" type="button" :aria-pressed="previewMode === 'fin'" @click="previewMode = 'fin'">单鳍实验</button>
+        <button class="preview-toggle" type="button" :aria-pressed="previewMode === 'idle'" @click="previewMode = 'idle'">分层待机</button>
+      </nav>
+    </div>
   </main>
 </template>
 
@@ -102,15 +111,39 @@ body,
 }
 
 .test-marker {
+  position: relative;
   display: block;
   width: min(280px, 100vw, 100vh);
   height: min(280px, 100vw, 100vh);
-  object-fit: contain;
   cursor: grab;
   user-select: none;
   margin: 0;
   padding: 0;
   background: transparent;
+}
+
+.preview-modes {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 3px;
+  max-width: calc(100% - 4px);
+}
+
+.preview-toggle {
+  height: 20px;
+  max-width: calc(100% - 4px);
+  box-sizing: border-box;
+  padding: 0 5px;
+  border: 1px solid #84634b;
+  border-radius: 4px;
+  background: #fff8ed;
+  color: #513621;
+  font: 11px/18px "Microsoft YaHei", sans-serif;
+  cursor: pointer;
 }
 
 .test-marker:active {
