@@ -27,16 +27,151 @@ jobs:
           $sdk = '10.0.26100.0'
           $toolsetFamily = '14.44'
           $rust = "1.100.0-$target"
+          Write-Host 'Preflight: inherited environment'
+          $blockedVariables = '^(NODE_OPTIONS|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|NODE_DEBUG|NODE_DEBUG_NATIVE|NAPI_RS_(NATIVE_LIBRARY_PATH|FORCE_WASI|ENFORCE_VERSION_CHECK)|NODE_AUTH_TOKEN|NPM_TOKEN|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE)$'
+          $compilerOverrides = '^(RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTFLAGS|RUSTC_BOOTSTRAP|CARGO|CARGO_ENCODED_RUSTFLAGS|CARGO_LOG|RUST_LOG|CARGO_(BUILD|PROFILE|REGISTRY|REGISTRIES|HTTP|NET|TARGET_.+)_.*|CL|_CL_|LINK|_LINK_|INCLUDE|LIB|LIBPATH|(?:(?:HOST|TARGET)_)?(?:CC|CXX|AR|CFLAGS|CXXFLAGS|ARFLAGS|RANLIB)(?:_.+)?)$'
+          foreach ($entry in Get-ChildItem Env:) {
+            if (($entry.Name -match $blockedVariables -or $entry.Name -match $compilerOverrides) -and
+                ![string]::IsNullOrEmpty($entry.Value)) {
+              throw "Unexpected inherited setting: $($entry.Name)"
+            }
+          }
+          Get-ChildItem Env: | Where-Object Name -match '^(GIT_|GCM_|NPM_CONFIG_|NODE_PATH$|PNPM_HOME$|RUSTUP_TOOLCHAIN$|ACTIONS_RUNTIME_TOKEN$)' | Remove-Item
+          $env:GIT_CONFIG_NOSYSTEM = '1'
+          $env:GIT_CONFIG_GLOBAL = 'NUL'
+          $env:GIT_TERMINAL_PROMPT = '0'
+          $env:GIT_ALLOW_PROTOCOL = 'https'
+          $env:NPM_CONFIG_USERCONFIG = 'NUL'
+          $env:NPM_CONFIG_GLOBALCONFIG = 'NUL'
           $env:RUSTUP_AUTO_INSTALL = '0'
-          $gitVersion = git --version
-          $rustupVersion = rustup --version 2>$null | Select-Object -First 1
+
+          # Tauri's build hook can launch CMD without /d. Read both registry views.
+          foreach ($hive in @([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryHive]::LocalMachine)) {
+            foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)) {
+              $root = $null
+              $key = $null
+              $autoRun = $null
+              $location = "$hive ($view)\Software\Microsoft\Command Processor"
+              try {
+                $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+                $key = $root.OpenSubKey('Software\Microsoft\Command Processor', $false)
+                if ($null -ne $key -and $key.GetValueNames() -contains 'AutoRun') {
+                  $autoRun = $key.GetValue('AutoRun', $false, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                }
+              } catch {
+                throw "Unable to check CMD AutoRun at $location."
+              } finally {
+                if ($null -ne $key) { $key.Dispose() }
+                if ($null -ne $root) { $root.Dispose() }
+              }
+              if ($null -ne $autoRun -and ($autoRun -isnot [string] -or $autoRun.Length -gt 0)) {
+                throw "Unexpected CMD AutoRun value at $location."
+              }
+            }
+          }
+
+          function Assert-LocalDirectory([string] $directory) {
+            if ($directory -notmatch '^[A-Za-z]:[\\/]' -or $directory.Contains(';')) {
+              throw 'Expected an absolute Windows tool or workspace directory.'
+            }
+            $ancestors = [Collections.Generic.Stack[string]]::new()
+            for ($dir = [IO.DirectoryInfo]::new($directory); $null -ne $dir; $dir = $dir.Parent) {
+              $ancestors.Push($dir.FullName)
+            }
+            foreach ($path in $ancestors) {
+              $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+              if ($item -isnot [IO.DirectoryInfo] -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Required tool or workspace directory is missing or a reparse point.'
+              }
+            }
+          }
+
+          function Assert-LocalFile([string] $file) {
+            Assert-LocalDirectory ([IO.Path]::GetDirectoryName($file))
+            $item = Get-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+            if ($item -isnot [IO.FileInfo] -or
+                ($item.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device))) {
+              throw "Required regular file is missing or redirected: $([IO.Path]::GetFileName($file))"
+            }
+          }
+
+          function Assert-X64Image([string] $file) {
+            $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($file))
+            try {
+              $stream = $reader.BaseStream
+              if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) { throw 'Invalid PE header.' }
+              $stream.Position = 60
+              $offset = $reader.ReadInt32()
+              if ($offset -lt 64 -or $offset -gt ($stream.Length - 6)) { throw 'Invalid PE offset.' }
+              $stream.Position = $offset
+              if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne 0x8664) {
+                throw 'Expected a Windows x64 tool executable.'
+              }
+            } finally { $reader.Dispose() }
+          }
+
+          function Write-WindowsToolVersion([string] $file) {
+            Assert-X64Image $file
+            $name = [IO.Path]::GetFileName($file)
+            $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($file)
+            if ($version.FileMajorPart -le 0) { throw "Missing tool version metadata: $name" }
+            Write-Host "$name version $($version.FileMajorPart).$($version.FileMinorPart).$($version.FileBuildPart).$($version.FilePrivatePart)"
+          }
+
+          function Test-ApprovedPath([string] $actual, [string[]] $expectedPaths) {
+            foreach ($expected in $expectedPaths) {
+              if ([string]::Equals($actual, $expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+            }
+            return $false
+          }
+
+          function Assert-ToolResolution([string] $name, [string] $expected) {
+            $resolved = Get-Command $name -ErrorAction Stop
+            if ($resolved.CommandType -ne 'Application' -or
+                ![string]::Equals($resolved.Path, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Unexpected command resolution: $name"
+            }
+          }
+
+          Assert-LocalDirectory $env:RUNNER_TEMP
+          $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'moyu-cargo'
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'moyu-target'
+          $env:CARGO_REGISTRIES_CRATES_IO_PROTOCOL = 'sparse'
+          foreach ($path in @($env:CARGO_HOME, $env:CARGO_TARGET_DIR)) {
+            if (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue) {
+              throw 'Cargo home and target must be new temporary paths.'
+            }
+          }
+
+          Write-Host 'Preflight: Git and system tools'
+          # GitHub's Windows image installs Git under Program Files and adds Git\bin to PATH.
+          $gitExe = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Git\bin\git.exe'
+          $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+          $tarExe = Join-Path ([Environment]::SystemDirectory) 'tar.exe'
+          foreach ($file in @($gitExe, $cmdExe, $tarExe)) { Assert-LocalFile $file }
+          foreach ($file in @($cmdExe, $tarExe)) { Write-WindowsToolVersion $file }
+          if (![string]::Equals($env:COMSPEC, $cmdExe, [StringComparison]::OrdinalIgnoreCase) -or
+              '.EXE' -notin ($env:PATHEXT -split ';') -or '.CMD' -notin ($env:PATHEXT -split ';')) {
+            throw 'Unexpected COMSPEC or PATHEXT.'
+          }
+
+          # The image provisions the default profile; jobs may use its per-user copy.
+          $userProfile = [Environment]::GetFolderPath('UserProfile')
+          $defaultProfile = Join-Path ([IO.Path]::GetDirectoryName($userProfile)) 'Default'
+          $rustHomes = @((Join-Path $userProfile '.rustup'), (Join-Path $defaultProfile '.rustup'))
+          if ([string]::IsNullOrEmpty($env:RUSTUP_HOME)) { $env:RUSTUP_HOME = $rustHomes[0] }
+          if (!(Test-ApprovedPath $env:RUSTUP_HOME $rustHomes)) { throw 'Unexpected RUSTUP_HOME.' }
+          Assert-LocalDirectory $env:RUSTUP_HOME
+          $rustupExe = (Get-Command rustup.exe -CommandType Application -ErrorAction Stop).Path
+          $rustupPaths = @((Join-Path $userProfile '.cargo\bin\rustup.exe'),
+              (Join-Path $defaultProfile '.cargo\bin\rustup.exe'))
+          if (!(Test-ApprovedPath $rustupExe $rustupPaths)) { throw 'Unexpected rustup.exe installation path.' }
+          Assert-LocalFile $rustupExe
+          $gitVersion = & $gitExe --version
           $gitSupported = $gitVersion -cmatch '^git version (2\.\d+\.\d+)\.windows\.\d+$' -and
               [version]$Matches[1] -ge [version]'2.56.1'
-          $rustupSupported = $rustupVersion -cmatch '^rustup (1\.\d+\.\d+)\s' -and
-              [version]$Matches[1] -ge [version]'1.29.3'
-          if ($env:ImageOS -cne 'win22' -or $env:RUNNER_ARCH -cne 'X64' -or
-              !$gitSupported -or !$rustupSupported) {
-            throw 'Unexpected runner OS, architecture, Git or rustup version.'
+          if ($env:ImageOS -cne 'win22' -or $env:RUNNER_ARCH -cne 'X64' -or !$gitSupported) {
+            throw 'Unexpected runner OS, architecture or Git version.'
           }
 
           if ([string]::IsNullOrWhiteSpace($env:RUNNER_TOOL_CACHE) -or
@@ -50,25 +185,9 @@ jobs:
           $nodeExe = [IO.Path]::Combine($nodeDirectory, 'node.exe')
           $completeMarker = [IO.Path]::Combine($nodeVersionDirectory, 'x64.complete')
 
-          # Check ancestors from the drive root before inspecting children.
-          $nodeAncestors = [Collections.Generic.Stack[string]]::new()
-          for ($dir = [IO.DirectoryInfo]::new($nodeDirectory); $null -ne $dir; $dir = $dir.Parent) {
-            $nodeAncestors.Push($dir.FullName)
-          }
-          foreach ($path in $nodeAncestors) {
-            $entry = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-            if ($entry -isnot [IO.DirectoryInfo] -or
-                ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-              throw "Required Node cache directory is missing or a reparse point: $path"
-            }
-          }
-          foreach ($path in @($completeMarker, $nodeExe)) {
-            $entry = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-            if ($entry -isnot [IO.FileInfo] -or
-                ($entry.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device))) {
-              throw "Required Node cache entry is missing or not a regular file: $path"
-            }
-          }
+          Write-Host 'Preflight: cached Node'
+          Assert-LocalFile $completeMarker
+          Assert-LocalFile $nodeExe
 
           function Assert-NodeRuntime([string] $command) {
             if ((& $command --version) -cne 'v24.22.3' -or
@@ -79,13 +198,12 @@ jobs:
           }
 
           function Select-CachedNode {
-            $env:PATH = "$nodeDirectory;$env:PATH"
+            $remainingPath = $env:PATH -split ';' | Where-Object {
+              ![string]::Equals($_, $nodeDirectory, [StringComparison]::OrdinalIgnoreCase)
+            }
+            $env:PATH = (@($nodeDirectory) + @($remainingPath)) -join ';'
             foreach ($name in @('node.exe', 'node')) {
-              $resolved = Get-Command $name -ErrorAction Stop
-              if ($resolved.CommandType -ne 'Application' -or
-                  ![string]::Equals($resolved.Path, $nodeExe, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "$name did not resolve to the verified cached Node executable."
-              }
+              Assert-ToolResolution $name $nodeExe
             }
             Assert-NodeRuntime 'node'
           }
@@ -94,7 +212,7 @@ jobs:
           Select-CachedNode
 
           # Require a preinstalled toolchain. Never invoke rustup install or update.
-          $installed = rustup toolchain list
+          $installed = & $rustupExe toolchain list
           if (($installed -join "`n") -cnotmatch '(?m)^1\.100\.0-x86_64-pc-windows-msvc(?:\s|$)' -and
               ($installed -join "`n") -cnotmatch '(?m)^stable-x86_64-pc-windows-msvc(?:\s|$)') {
             throw "Required MSVC Rust toolchain is absent."
@@ -102,53 +220,84 @@ jobs:
           if (($installed -join "`n") -cnotmatch '(?m)^1\.100\.0-x86_64-pc-windows-msvc(?:\s|$)') {
             $rust = "stable-$target"
           }
-          $env:PATH = "$(Split-Path (rustup which --toolchain $rust cargo.exe));$env:PATH"
-          if ((rustc --version) -cnotmatch '^rustc 1\.100\.0\s' -or
-              (cargo --version) -cnotmatch '^cargo 1\.100\.0\s' -or
-              (rustc --print host-tuple) -cne $target) {
+          $rustBin = Join-Path $env:RUSTUP_HOME "toolchains\$rust\bin"
+          $cargoExe = Join-Path $rustBin 'cargo.exe'
+          $rustcExe = Join-Path $rustBin 'rustc.exe'
+          foreach ($file in @($cargoExe, $rustcExe)) { Assert-LocalFile $file }
+          # rustup --version may query the active compiler; select it only after validation.
+          $env:RUSTUP_TOOLCHAIN = $rust
+          $env:PATH = "$rustBin;$env:PATH"
+          $rustupVersion = & $rustupExe --version 2>$null | Select-Object -First 1
+          $rustupSupported = $rustupVersion -cmatch '^rustup (1\.\d+\.\d+)\s' -and
+              [version]$Matches[1] -ge [version]'1.29.3'
+          if (!$rustupSupported) {
+            throw 'Unexpected rustup version.'
+          }
+          $env:RUSTC = $rustcExe
+          if ((& $rustcExe --version) -cnotmatch '^rustc 1\.100\.0\s' -or
+              (& $cargoExe --version) -cnotmatch '^cargo 1\.100\.0\s' -or
+              (& $rustcExe --print host-tuple) -cne $target) {
             throw 'Unexpected Rust/Cargo version or host target.'
           }
 
           $vs = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+          Write-Host 'Preflight: MSVC and Windows SDK'
           $vsDev = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
-          $buildEnv = cmd.exe /d /c ('call "{0}" -no_logo -arch=x64 -host_arch=x64 -winsdk={1} -vcvars_ver={2} >nul && for %V in (Path Include Lib LibPath VCToolsVersion WindowsSDKVersion) do @set %V' -f $vsDev, $sdk, $toolsetFamily)
+          Assert-LocalFile $vsDev
+          $buildEnv = & $cmdExe /d /c ('call "{0}" -no_logo -arch=x64 -host_arch=x64 -winsdk={1} -vcvars_ver={2} >nul && for %V in (Path Include Lib LibPath VCToolsVersion WindowsSDKVersion WindowsSdkDir) do @set %V' -f $vsDev, $sdk, $toolsetFamily)
+          $imported = @{}
           foreach ($line in $buildEnv) {
-            if ($line -match '^(Path|Include|Lib|LibPath|VCToolsVersion|WindowsSDKVersion)=(.*)$') {
-              [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+            if ($line -match '^(Path|Include|Lib|LibPath|VCToolsVersion|WindowsSDKVersion|WindowsSdkDir)=(.*)$') {
+              $imported[$Matches[1]] = $Matches[2]
             }
           }
-          Select-CachedNode
-          $cl = Get-Command cl.exe -CommandType Application
-          $link = Get-Command link.exe -CommandType Application
-          $toolset = $env:VCToolsVersion
-          $vcBin = Join-Path $vs "VC\Tools\MSVC\$toolset\bin\Hostx64\x64"
-          if ($toolset -cnotmatch '^14\.44\.\d+$' -or $env:WindowsSDKVersion.TrimEnd('\') -cne $sdk -or
-              $cl.Source -ine (Join-Path $vcBin 'cl.exe') -or
-              $link.Source -ine (Join-Path $vcBin 'link.exe')) {
-            throw 'Unexpected MSVC compiler, linker or Windows SDK.'
+          foreach ($name in @('Path', 'Include', 'Lib', 'LibPath', 'VCToolsVersion', 'WindowsSDKVersion', 'WindowsSdkDir')) {
+            if ([string]::IsNullOrWhiteSpace($imported[$name])) {
+              throw "Missing Visual Studio environment setting: $name"
+            }
+            [Environment]::SetEnvironmentVariable($name, $imported[$name], 'Process')
           }
+          Select-CachedNode
+          Assert-ToolResolution 'cargo.exe' $cargoExe
+          Assert-ToolResolution 'rustc.exe' $rustcExe
+          $toolset = $env:VCToolsVersion
+          $kitsRoots = @(foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
+                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+              $kits = Get-ItemPropertyValue -LiteralPath $key -Name KitsRoot10 -ErrorAction SilentlyContinue
+              if ($kits) { [IO.Path]::GetFullPath($kits).TrimEnd('\') }
+            })
+          $sdkRoot = "$env:WindowsSdkDir".TrimEnd('\')
+          if ($toolset -cnotmatch '^14\.44\.\d+$' -or "$env:WindowsSDKVersion".TrimEnd('\') -cne $sdk -or
+              !$sdkRoot -or !(Test-ApprovedPath ([IO.Path]::GetFullPath($sdkRoot)) $kitsRoots)) {
+            throw 'Unexpected MSVC toolset or Windows SDK installation.'
+          }
+          $vcBin = Join-Path $vs "VC\Tools\MSVC\$toolset\bin\Hostx64\x64"
+          $sdkBin = Join-Path $sdkRoot "bin\$sdk\x64"
+          foreach ($file in @((Join-Path $vcBin 'cl.exe'), (Join-Path $vcBin 'link.exe'),
+                  (Join-Path $sdkBin 'rc.exe'), (Join-Path $sdkBin 'mt.exe'))) {
+            Assert-LocalFile $file
+            $name = [IO.Path]::GetFileName($file)
+            Assert-ToolResolution $name $file
+            Write-WindowsToolVersion $file
+          }
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = Join-Path $vcBin 'link.exe'
           Write-Host "Image $env:ImageOS $env:ImageVersion; $gitVersion; Node 24.22.3; $rustupVersion"
-          rustc --version
-          cargo --version
-          Write-Host "MSVC $toolset; cl $($cl.Version); link $($link.Version); Windows SDK $sdk"
+          & $rustcExe --version
+          & $cargoExe --version
+          Write-Host "MSVC $toolset; Windows SDK $sdk"
 
-          # Ignore inherited Git configuration, askpass, tracing and credential helpers.
-          Get-ChildItem Env: | Where-Object Name -match '^(GIT_|GCM_)' | Remove-Item
-          $env:GIT_CONFIG_NOSYSTEM = '1'
-          $env:GIT_CONFIG_GLOBAL = 'NUL'
-          $env:GIT_TERMINAL_PROMPT = '0'
-          $env:GIT_ALLOW_PROTOCOL = 'https'
+          Write-Host 'Preflight: fixed source'
           $source = Join-Path $env:RUNNER_TEMP 'moyu-fixed-source'
           New-Item -ItemType Directory -Path $source | Out-Null
           Set-Location $source
-          git init --template=
-          git config core.autocrlf false
-          git -c credential.helper= -c http.followRedirects=false fetch --no-tags --depth=1 https://github.com/WGH777/moyu.git $sha
-          if ($sha -cnotmatch '^[0-9a-f]{40}$' -or (git rev-parse FETCH_HEAD) -cne $sha) {
+          & $gitExe init --template=
+          & $gitExe config core.autocrlf false
+          & $gitExe -c credential.helper= -c http.followRedirects=false fetch --no-tags --depth=1 https://github.com/WGH777/moyu.git $sha
+          if ($sha -cnotmatch '^[0-9a-f]{40}$' -or (& $gitExe rev-parse FETCH_HEAD) -cne $sha) {
             throw 'Fetched source SHA mismatch.'
           }
-          git checkout --detach $sha
-          if ((git rev-parse HEAD) -cne $sha) { throw 'Checked-out source SHA mismatch.' }
+          & $gitExe checkout --detach $sha
+          if ((& $gitExe rev-parse HEAD) -cne $sha) { throw 'Checked-out source SHA mismatch.' }
           Write-Host "Source $sha; workflow $env:GITHUB_WORKFLOW_SHA"
 
           $locks = 'pnpm-lock.yaml', 'src-tauri/Cargo.lock'
@@ -158,6 +307,7 @@ jobs:
             throw 'Unexpected lockfile format.'
           }
 
+          Write-Host 'Prepare: pnpm and Cargo dependencies'
           # Verify the pinned pnpm archive before extraction or execution.
           $tools = Join-Path $env:RUNNER_TEMP 'moyu-pnpm'
           New-Item -ItemType Directory -Path $tools | Out-Null
@@ -167,7 +317,7 @@ jobs:
           if ($actual -cne 'XN6SW08HX3Jetx+64YpC/+eEUkeJ8ZthxzHLhyHsKKruFg4BqNWvT+2ypCzb8wDv4j2zVrDUoXtNY+EfirfJVg==') {
             throw 'pnpm archive integrity mismatch.'
           }
-          tar.exe -xzf $archive -C $tools
+          & $tarExe -xzf $archive -C $tools
           $env:MOYU_PNPM_ENTRY = Join-Path $tools 'package\bin\pnpm.mjs'
           $env:MOYU_NODE_EXE = $nodeExe
           Set-Content -LiteralPath (Join-Path $tools 'pnpm.cmd') -Encoding ascii -Value @(
@@ -175,25 +325,34 @@ jobs:
               '@"%MOYU_NODE_EXE%" "%MOYU_PNPM_ENTRY%" %*')
           $env:PATH = "$tools;$env:PATH"
           Select-CachedNode
+          Assert-ToolResolution 'pnpm.cmd' (Join-Path $tools 'pnpm.cmd')
+          Assert-ToolResolution 'pnpm' (Join-Path $tools 'pnpm.cmd')
           if ((pnpm.cmd --version) -cne '11.25.0') { throw 'Unexpected pnpm version.' }
           Write-Host 'pnpm 11.25.0'
-
-          # Avoid inherited package-manager configuration and registry credentials.
-          Get-ChildItem Env: | Where-Object Name -match '^(NPM_CONFIG_|NPM_TOKEN$|NODE_AUTH_TOKEN$|CARGO_|ACTIONS_RUNTIME_TOKEN$)' | Remove-Item
-          $env:NPM_CONFIG_USERCONFIG = 'NUL'
-          $env:NPM_CONFIG_GLOBALCONFIG = 'NUL'
-          $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'moyu-cargo'
-          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'moyu-target'
-          $env:CARGO_REGISTRIES_CRATES_IO_PROTOCOL = 'sparse'
           pnpm.cmd install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org/ --store-dir "$tools\store"
           if ((Get-Content node_modules/@tauri-apps/cli/package.json -Raw | ConvertFrom-Json).version -cne '2.12.4') {
             throw 'Unexpected Tauri CLI version.'
           }
           Write-Host 'Tauri CLI 2.12.4'
-          cargo fetch --locked --target $target --manifest-path src-tauri/Cargo.toml
+          foreach ($name in @('config', 'config.toml')) {
+            if (Get-Item -LiteralPath (Join-Path $env:CARGO_HOME $name) -Force -ErrorAction SilentlyContinue) {
+              throw 'Unexpected configuration in Cargo home.'
+            }
+          }
+          # Cargo can load configuration in its working directory and ancestors.
+          for ($dir = [IO.DirectoryInfo]::new((Join-Path $source 'src-tauri')); $null -ne $dir; $dir = $dir.Parent) {
+            foreach ($name in @('.cargo\config', '.cargo\config.toml')) {
+              if (Get-Item -LiteralPath (Join-Path $dir.FullName $name) -Force -ErrorAction SilentlyContinue) {
+                throw 'Unexpected Cargo configuration in the source or an ancestor.'
+              }
+            }
+          }
+          & $cargoExe fetch --locked --target $target --manifest-path src-tauri/Cargo.toml
+          Write-Host 'Compile: fixed Windows x64 source'
           pnpm.cmd exec tauri build --no-bundle --target $target -- --frozen
 
-          git diff --quiet HEAD --
+          Write-Host 'Verify: source, lockfiles and output'
+          & $gitExe diff --quiet HEAD --
           $after = (Get-FileHash -LiteralPath $locks -Algorithm SHA256).Hash
           if (($before -join ',') -cne ($after -join ',')) { throw 'Lockfile bytes changed.' }
           $exe = Get-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "$target\release\moyu.exe")
