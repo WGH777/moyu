@@ -35,10 +35,63 @@ jobs:
           $rustupSupported = $rustupVersion -cmatch '^rustup (1\.\d+\.\d+)\s' -and
               [version]$Matches[1] -ge [version]'1.29.3'
           if ($env:ImageOS -cne 'win22' -or $env:RUNNER_ARCH -cne 'X64' -or
-              !$gitSupported -or !$rustupSupported -or
-              (node --version) -cne 'v24.22.3' -or (node -p 'process.arch') -cne 'x64') {
-            throw 'Unexpected runner OS, architecture, Git, Node.js or rustup version.'
+              !$gitSupported -or !$rustupSupported) {
+            throw 'Unexpected runner OS, architecture, Git or rustup version.'
           }
+
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TOOL_CACHE) -or
+              $env:RUNNER_TOOL_CACHE -notmatch '^[A-Za-z]:[\\/]' -or
+              $env:RUNNER_TOOL_CACHE.Contains(';')) {
+            throw 'RUNNER_TOOL_CACHE must be a nonempty absolute local Windows path without PATH separators.'
+          }
+          $nodeVersionDirectory = [IO.Path]::GetFullPath(
+              [IO.Path]::Combine($env:RUNNER_TOOL_CACHE, 'node', '24.22.3'))
+          $nodeDirectory = [IO.Path]::Combine($nodeVersionDirectory, 'x64')
+          $nodeExe = [IO.Path]::Combine($nodeDirectory, 'node.exe')
+          $completeMarker = [IO.Path]::Combine($nodeVersionDirectory, 'x64.complete')
+
+          # Check ancestors from the drive root before inspecting children.
+          $nodeAncestors = [Collections.Generic.Stack[string]]::new()
+          for ($dir = [IO.DirectoryInfo]::new($nodeDirectory); $null -ne $dir; $dir = $dir.Parent) {
+            $nodeAncestors.Push($dir.FullName)
+          }
+          foreach ($path in $nodeAncestors) {
+            $entry = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($entry -isnot [IO.DirectoryInfo] -or
+                ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              throw "Required Node cache directory is missing or a reparse point: $path"
+            }
+          }
+          foreach ($path in @($completeMarker, $nodeExe)) {
+            $entry = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($entry -isnot [IO.FileInfo] -or
+                ($entry.Attributes -band ([IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Device))) {
+              throw "Required Node cache entry is missing or not a regular file: $path"
+            }
+          }
+
+          function Assert-NodeRuntime([string] $command) {
+            if ((& $command --version) -cne 'v24.22.3' -or
+                (& $command -p 'process.platform') -cne 'win32' -or
+                (& $command -p 'process.arch') -cne 'x64') {
+              throw "Expected Node v24.22.3 (win32 x64) from $command."
+            }
+          }
+
+          function Select-CachedNode {
+            $env:PATH = "$nodeDirectory;$env:PATH"
+            foreach ($name in @('node.exe', 'node')) {
+              $resolved = Get-Command $name -ErrorAction Stop
+              if ($resolved.CommandType -ne 'Application' -or
+                  ![string]::Equals($resolved.Path, $nodeExe, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "$name did not resolve to the verified cached Node executable."
+              }
+            }
+            Assert-NodeRuntime 'node'
+          }
+
+          Assert-NodeRuntime $nodeExe
+          Select-CachedNode
 
           # Require a preinstalled toolchain. Never invoke rustup install or update.
           $installed = rustup toolchain list
@@ -64,6 +117,7 @@ jobs:
               [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
             }
           }
+          Select-CachedNode
           $cl = Get-Command cl.exe -CommandType Application
           $link = Get-Command link.exe -CommandType Application
           $toolset = $env:VCToolsVersion
@@ -115,8 +169,12 @@ jobs:
           }
           tar.exe -xzf $archive -C $tools
           $env:MOYU_PNPM_ENTRY = Join-Path $tools 'package\bin\pnpm.mjs'
-          Set-Content -LiteralPath (Join-Path $tools 'pnpm.cmd') -Encoding ascii -Value '@node.exe "%MOYU_PNPM_ENTRY%" %*'
+          $env:MOYU_NODE_EXE = $nodeExe
+          Set-Content -LiteralPath (Join-Path $tools 'pnpm.cmd') -Encoding ascii -Value @(
+              '@setlocal DisableDelayedExpansion',
+              '@"%MOYU_NODE_EXE%" "%MOYU_PNPM_ENTRY%" %*')
           $env:PATH = "$tools;$env:PATH"
+          Select-CachedNode
           if ((pnpm.cmd --version) -cne '11.25.0') { throw 'Unexpected pnpm version.' }
           Write-Host 'pnpm 11.25.0'
 
