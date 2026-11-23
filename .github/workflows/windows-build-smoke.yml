@@ -1,0 +1,147 @@
+name: Windows build smoke
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  compile:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'WGH777/moyu' && github.ref == 'refs/heads/master'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Compile the fixed Windows x64 source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          # Remove this stop only after the build-tool and build-script HOLDs are resolved.
+          throw 'HOLD: runner toolchain and dependency build scripts require review.'
+
+          $sha = '073892913e252b05a9ef1df20f142393bfd38ebc'
+          $target = 'x86_64-pc-windows-msvc'
+          $sdk = '10.0.26100.0'
+          $toolsetFamily = '14.44'
+          $rust = "1.100.0-$target"
+          $env:RUSTUP_AUTO_INSTALL = '0'
+          $gitVersion = git --version
+          $rustupVersion = rustup --version 2>$null | Select-Object -First 1
+          $gitSupported = $gitVersion -cmatch '^git version (2\.\d+\.\d+)\.windows\.\d+$' -and
+              [version]$Matches[1] -ge [version]'2.56.1'
+          $rustupSupported = $rustupVersion -cmatch '^rustup (1\.\d+\.\d+)\s' -and
+              [version]$Matches[1] -ge [version]'1.29.3'
+          if ($env:ImageOS -cne 'win22' -or $env:RUNNER_ARCH -cne 'X64' -or
+              !$gitSupported -or !$rustupSupported -or
+              (node --version) -cne 'v24.22.3' -or (node -p 'process.arch') -cne 'x64') {
+            throw 'Unexpected runner OS, architecture, Git, Node.js or rustup version.'
+          }
+
+          # Require a preinstalled toolchain. Never invoke rustup install or update.
+          $installed = rustup toolchain list
+          if (($installed -join "`n") -cnotmatch '(?m)^1\.100\.0-x86_64-pc-windows-msvc(?:\s|$)' -and
+              ($installed -join "`n") -cnotmatch '(?m)^stable-x86_64-pc-windows-msvc(?:\s|$)') {
+            throw "Required MSVC Rust toolchain is absent."
+          }
+          if (($installed -join "`n") -cnotmatch '(?m)^1\.100\.0-x86_64-pc-windows-msvc(?:\s|$)') {
+            $rust = "stable-$target"
+          }
+          $env:PATH = "$(Split-Path (rustup which --toolchain $rust cargo.exe));$env:PATH"
+          if ((rustc --version) -cnotmatch '^rustc 1\.100\.0\s' -or
+              (cargo --version) -cnotmatch '^cargo 1\.100\.0\s' -or
+              (rustc --print host-tuple) -cne $target) {
+            throw 'Unexpected Rust/Cargo version or host target.'
+          }
+
+          $vs = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+          $vsDev = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $buildEnv = cmd.exe /d /c ('call "{0}" -no_logo -arch=x64 -host_arch=x64 -winsdk={1} -vcvars_ver={2} >nul && for %V in (Path Include Lib LibPath VCToolsVersion WindowsSDKVersion) do @set %V' -f $vsDev, $sdk, $toolsetFamily)
+          foreach ($line in $buildEnv) {
+            if ($line -match '^(Path|Include|Lib|LibPath|VCToolsVersion|WindowsSDKVersion)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+            }
+          }
+          $cl = Get-Command cl.exe -CommandType Application
+          $link = Get-Command link.exe -CommandType Application
+          $toolset = $env:VCToolsVersion
+          $vcBin = Join-Path $vs "VC\Tools\MSVC\$toolset\bin\Hostx64\x64"
+          if ($toolset -cnotmatch '^14\.44\.\d+$' -or $env:WindowsSDKVersion.TrimEnd('\') -cne $sdk -or
+              $cl.Source -ine (Join-Path $vcBin 'cl.exe') -or
+              $link.Source -ine (Join-Path $vcBin 'link.exe')) {
+            throw 'Unexpected MSVC compiler, linker or Windows SDK.'
+          }
+          Write-Host "Image $env:ImageOS $env:ImageVersion; $gitVersion; Node 24.22.3; $rustupVersion"
+          rustc --version
+          cargo --version
+          Write-Host "MSVC $toolset; cl $($cl.Version); link $($link.Version); Windows SDK $sdk"
+
+          # Ignore inherited Git configuration, askpass, tracing and credential helpers.
+          Get-ChildItem Env: | Where-Object Name -match '^(GIT_|GCM_)' | Remove-Item
+          $env:GIT_CONFIG_NOSYSTEM = '1'
+          $env:GIT_CONFIG_GLOBAL = 'NUL'
+          $env:GIT_TERMINAL_PROMPT = '0'
+          $env:GIT_ALLOW_PROTOCOL = 'https'
+          $source = Join-Path $env:RUNNER_TEMP 'moyu-fixed-source'
+          New-Item -ItemType Directory -Path $source | Out-Null
+          Set-Location $source
+          git init --template=
+          git config core.autocrlf false
+          git -c credential.helper= -c http.followRedirects=false fetch --no-tags --depth=1 https://github.com/WGH777/moyu.git $sha
+          if ($sha -cnotmatch '^[0-9a-f]{40}$' -or (git rev-parse FETCH_HEAD) -cne $sha) {
+            throw 'Fetched source SHA mismatch.'
+          }
+          git checkout --detach $sha
+          if ((git rev-parse HEAD) -cne $sha) { throw 'Checked-out source SHA mismatch.' }
+          Write-Host "Source $sha; workflow $env:GITHUB_WORKFLOW_SHA"
+
+          $locks = 'pnpm-lock.yaml', 'src-tauri/Cargo.lock'
+          $before = (Get-FileHash -LiteralPath $locks -Algorithm SHA256).Hash
+          if ((Get-Content $locks[0] -TotalCount 1) -cne "lockfileVersion: '9.0'" -or
+              (Get-Content $locks[1] -TotalCount 3 | Select-Object -Last 1) -cne 'version = 4') {
+            throw 'Unexpected lockfile format.'
+          }
+
+          # Verify the pinned pnpm archive before extraction or execution.
+          $tools = Join-Path $env:RUNNER_TEMP 'moyu-pnpm'
+          New-Item -ItemType Directory -Path $tools | Out-Null
+          $archive = Join-Path $tools 'pnpm.tgz'
+          Invoke-WebRequest 'https://registry.npmjs.org/pnpm/-/pnpm-11.25.0.tgz' -MaximumRedirection 0 -OutFile $archive
+          $actual = [Convert]::ToBase64String([Convert]::FromHexString((Get-FileHash $archive -Algorithm SHA512).Hash))
+          if ($actual -cne 'XN6SW08HX3Jetx+64YpC/+eEUkeJ8ZthxzHLhyHsKKruFg4BqNWvT+2ypCzb8wDv4j2zVrDUoXtNY+EfirfJVg==') {
+            throw 'pnpm archive integrity mismatch.'
+          }
+          tar.exe -xzf $archive -C $tools
+          $env:MOYU_PNPM_ENTRY = Join-Path $tools 'package\bin\pnpm.mjs'
+          Set-Content -LiteralPath (Join-Path $tools 'pnpm.cmd') -Encoding ascii -Value '@node.exe "%MOYU_PNPM_ENTRY%" %*'
+          $env:PATH = "$tools;$env:PATH"
+          if ((pnpm.cmd --version) -cne '11.25.0') { throw 'Unexpected pnpm version.' }
+          Write-Host 'pnpm 11.25.0'
+
+          # Avoid inherited package-manager configuration and registry credentials.
+          Get-ChildItem Env: | Where-Object Name -match '^(NPM_CONFIG_|NPM_TOKEN$|NODE_AUTH_TOKEN$|CARGO_|ACTIONS_RUNTIME_TOKEN$)' | Remove-Item
+          $env:NPM_CONFIG_USERCONFIG = 'NUL'
+          $env:NPM_CONFIG_GLOBALCONFIG = 'NUL'
+          $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'moyu-cargo'
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'moyu-target'
+          $env:CARGO_REGISTRIES_CRATES_IO_PROTOCOL = 'sparse'
+          pnpm.cmd install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org/ --store-dir "$tools\store"
+          if ((Get-Content node_modules/@tauri-apps/cli/package.json -Raw | ConvertFrom-Json).version -cne '2.12.4') {
+            throw 'Unexpected Tauri CLI version.'
+          }
+          Write-Host 'Tauri CLI 2.12.4'
+          cargo fetch --locked --target $target --manifest-path src-tauri/Cargo.toml
+          pnpm.cmd exec tauri build --no-bundle --target $target -- --frozen
+
+          git diff --quiet HEAD --
+          $after = (Get-FileHash -LiteralPath $locks -Algorithm SHA256).Hash
+          if (($before -join ',') -cne ($after -join ',')) { throw 'Lockfile bytes changed.' }
+          $exe = Get-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "$target\release\moyu.exe")
+          if ($exe.PSIsContainer -or $exe.Length -le 0 -or
+              ($exe.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Expected a nonempty regular moyu.exe.'
+          }
+          $digest = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "$($exe.Name) $($exe.Length) bytes SHA-256 $digest"
